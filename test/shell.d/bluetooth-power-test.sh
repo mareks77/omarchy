@@ -4,21 +4,28 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+monitor_pid=""
+cleanup() {
+  if [[ -n $monitor_pid ]]; then
+    kill "$monitor_pid" 2>/dev/null || true
+    wait "$monitor_pid" 2>/dev/null || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 mkdir -p "$tmp/bin" "$tmp/home"
 export HOME="$tmp/home" XDG_STATE_HOME="$tmp/state with spaces" MOCK_DIR="$tmp"
 export PATH="$tmp/bin:$ROOT/bin:$PATH" OMARCHY_PATH="$ROOT" OMARCHY_BLUETOOTH_POWER_WAIT_SECONDS=0
-export OMARCHY_BLUETOOTH_MIGRATION_MARKER="$tmp/migrated"
 state_file="$XDG_STATE_HOME/omarchy/bluetooth-power"
 
 cat >"$tmp/bin/busctl" <<'SH'
 #!/bin/bash
 while [[ $1 == --* ]]; do shift; done
 printf 'busctl %s\n' "$*" >>"$MOCK_DIR/log"
-[[ -n ${MOCK_BUS_DOWN:-} ]] && exit 1
+[[ -n ${MOCK_BUS_DOWN:-} || -f $MOCK_DIR/bus-unavailable ]] && exit 1
 case "$1" in
   tree)
-    [[ -n ${MOCK_NO_ADAPTERS:-} ]] && exit 0
+    [[ -n ${MOCK_NO_ADAPTERS:-} || -f $MOCK_DIR/adapter-unavailable ]] && exit 0
     printf '/org/bluez/hci0\n/org/bluez/hci0/dev_AA_BB\n'
     [[ -f $MOCK_DIR/hci1 ]] && echo /org/bluez/hci1
     ;;
@@ -27,7 +34,7 @@ case "$1" in
     printf 'b %s\n' "$(cat "$MOCK_DIR/${3##*/}")"
     ;;
   set-property)
-    [[ -n ${MOCK_SET_FAIL:-} ]] && exit 1
+    [[ -n ${MOCK_SET_FAIL:-} || -f $MOCK_DIR/set-fail ]] && exit 1
     if [[ -f $MOCK_DIR/reject-once ]]; then
       rm "$MOCK_DIR/reject-once"
       exit 1
@@ -71,15 +78,21 @@ SH
 
 cat >"$tmp/bin/sudo" <<'SH'
 #!/bin/bash
-[[ $* == 'rfkill unblock bluetooth' || $* == "install -Dm644 /dev/null $MOCK_DIR/migrated" ]] || exit 1
-"$@"
+echo 'migration must not request elevated radio changes' >&2
+exit 1
+SH
+
+cat >"$tmp/bin/mv" <<'SH'
+#!/bin/bash
+[[ -n ${MOCK_RENAME_FAIL:-} ]] && exit 1
+/usr/bin/mv "$@"
 SH
 chmod +x "$tmp/bin/"*
 
 reset_radio() {
   echo "$1" >"$tmp/hci0"
   echo none >"$tmp/block"
-  rm -f "$tmp/hci1" "$tmp/reject-once" "$tmp/migrated" "$state_file"
+  rm -f "$tmp/hci1" "$tmp/reject-once" "$tmp/bus-unavailable" "$tmp/adapter-unavailable" "$tmp/set-fail" "$state_file"
   : >"$tmp/log"
 }
 
@@ -194,16 +207,25 @@ reset_radio false
 echo soft >"$tmp/block"
 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
 assert_saved off
-[[ $(cat "$tmp/block") == none && $(cat "$tmp/hci0") == false ]] || fail "migration preserves off without its old block"
-echo true >"$tmp/hci0" # An interrupted unblock triggered AutoEnable.
+[[ $(cat "$tmp/block") == soft && $(cat "$tmp/hci0") == false ]] || fail "migration changes an existing software block"
 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
 assert_saved off
-[[ $(cat "$tmp/hci0") == false ]] || fail "migration retry recaptures a temporary on state"
-pass "migration clears the old block, preserves off and is retry-safe"
+[[ $(cat "$tmp/block") == soft ]] || fail "migration retry clears an existing software block"
+! grep -q '^rfkill unblock' "$tmp/log" || fail "migration clears airplane mode"
+! grep -q 'set-property' "$tmp/log" || fail "migration directly changes radio power"
+pass "migration preserves all existing blocks on first run and retry"
+
+reset_radio false
 echo soft >"$tmp/block"
+if MOCK_RENAME_FAIL=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"; then
+  fail "migration continues after an atomic preference write fails"
+fi
+[[ ! -e $state_file && $(cat "$tmp/block") == soft ]] || fail "failed migration leaves partial state or changes radio blocks"
+! compgen -G "$state_file.*" >/dev/null || fail "failed migration leaves staging files"
 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
-[[ $(cat "$tmp/block") == soft ]] || fail "second account's migration clears a new external block"
-pass "machine marker protects an external block on subsequent migrations"
+assert_saved off
+[[ $(stat -c %a "$state_file") == 600 ]] || fail "migration preference has the helper's private mode"
+pass "migration preference writes are atomic, private and retry-safe"
 
 reset_radio true
 MOCK_NO_SESSION=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
@@ -215,12 +237,68 @@ reset_radio false
 echo soft >"$tmp/block"
 MOCK_BUS_DOWN=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
 assert_saved off
-[[ $(cat "$tmp/block") == none ]] || fail "offline migration leaves the legacy block"
-pass "migration preserves a blocked off preference even without BlueZ"
+[[ $(cat "$tmp/block") == soft ]] || fail "offline migration clears an existing radio block"
+pass "migration captures blocked off atomically without BlueZ or clearing the block"
+
+reset_radio true
+omarchy-bluetooth-power save on
+if MOCK_RENAME_FAIL=1 omarchy-bluetooth-power save off; then fail "failed atomic save is reported"; fi
+assert_saved on
+if omarchy-bluetooth-power save invalid; then fail "invalid preference is rejected"; fi
+assert_saved on
+! compgen -G "$state_file.*" >/dev/null || fail "failed save leaves staging files"
+pass "explicit preferences use atomic writes without damaging existing state"
+
+wait_for_off() {
+  for (( attempt=0; attempt<100; attempt++ )); do
+    [[ $(cat "$tmp/hci0") == false ]] && return 0
+    sleep 0.1
+  done
+  fail "monitor restores off after availability returns"
+}
+
+stop_monitor() {
+  # systemd runs ExecStop while the Type=simple process is still alive.
+  omarchy-bluetooth-power save
+  kill "$monitor_pid"
+  wait "$monitor_pid" || true
+  monitor_pid=""
+}
+
+for unavailable in bus-unavailable adapter-unavailable set-fail; do
+  reset_radio true
+  omarchy-bluetooth-power save off
+  touch "$tmp/$unavailable"
+  omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+  monitor_pid=$!
+  sleep 0.3
+  kill -0 "$monitor_pid" || fail "monitor exits while $unavailable"
+  [[ $(cat "$tmp/hci0") == true ]] || fail "monitor changes power before $unavailable is resolved"
+  rm "$tmp/$unavailable"
+  wait_for_off
+  kill -0 "$monitor_pid" || fail "monitor exits after restoration"
+  busctl --system set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b true
+  stop_monitor
+  assert_saved on
+  pass "session waits through $unavailable, restores and saves external changes at logout"
+done
+
+reset_radio false
+touch "$tmp/bus-unavailable"
+omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+monitor_pid=$!
+sleep 0.3
+kill -0 "$monitor_pid" || fail "session without saved state exits when BlueZ is down"
+rm "$tmp/bus-unavailable"
+echo true >"$tmp/hci0"
+stop_monitor
+assert_saved on
+pass "session without an initial preference still snapshots a late Bluetooth startup"
 
 unit="$ROOT/default/systemd/user/omarchy-bluetooth-power.service"
-for line in 'ExecStart=/usr/bin/omarchy-bluetooth-power restore' 'ExecStop=/usr/bin/omarchy-bluetooth-power save' 'PartOf=graphical-session.target' 'After=graphical-session.target' 'RemainAfterExit=yes' 'WantedBy=graphical-session.target'; do
+for line in 'ExecStart=/usr/bin/omarchy-bluetooth-power monitor' 'ExecStop=/usr/bin/omarchy-bluetooth-power save' 'PartOf=graphical-session.target' 'After=graphical-session.target' 'Type=simple' 'Restart=on-failure' 'WantedBy=graphical-session.target'; do
   grep -qxF "$line" "$unit" || fail "Bluetooth state unit is missing $line"
 done
+! grep -q '^ExecCondition=\|^ConditionPath' "$unit" || fail "session unit skips late Bluetooth availability"
 grep -qF 'omarchy-bluetooth-power.service' "$ROOT/install/user/first-run/enable-user-units.sh" || fail "first run enables Bluetooth state unit"
 pass "graphical session restores on login and saves on logout for new installs"

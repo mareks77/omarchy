@@ -2,14 +2,15 @@
 Description=Restore and save Bluetooth power preference
 After=graphical-session.target
 PartOf=graphical-session.target
-ConditionPathIsDirectory=/sys/class/bluetooth
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecCondition=/usr/bin/systemctl is-active --quiet bluetooth.service
-ExecStart=/usr/bin/omarchy-bluetooth-power restore
+# Stay active while waiting for BlueZ, rather than skipping the session when
+# bluetoothd or a USB adapter becomes available after graphical login.
+Type=simple
+ExecStart=/usr/bin/omarchy-bluetooth-power monitor
 ExecStop=/usr/bin/omarchy-bluetooth-power save
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=graphical-session.target
