@@ -2,7 +2,7 @@
 
 # omarchy:summary=Turn Bluetooth on or off, remembered at login
 # omarchy:group=bluetooth
-# omarchy:args=<on|off|toggle|is-on|save|restore|monitor> [on|off]
+# omarchy:args=<on|off|toggle|is-on|save|restore|monitor> [on|off|--adopt]
 # omarchy:examples=omarchy bluetooth power off | omarchy bluetooth power save off
 
 # Normal off is BlueZ Powered=false, not an rfkill block: applications such as
@@ -114,7 +114,9 @@ monitor_power() {
   trap cleanup_monitor EXIT
   trap 'exit 0' TERM INT
 
-  if [[ -f $STATE_FILE ]]; then
+  # An update-session monitor adopts live power without applying old state.
+  # Its only job is capturing subsequent changes on logout.
+  if [[ ${1:-} != "--adopt" && -f $STATE_FILE ]]; then
     until power_state >/dev/null && restore_power; do
       sleep 2
     done
@@ -165,10 +167,13 @@ case "${1:-}" in
     # Type=simple keeps the unit active (including its logout snapshot) even
     # when BlueZ is initially unavailable. Retry until the preference can be
     # restored; do not force bluetoothd to start or lift external radio blocks.
-    monitor_power
+    case "${2:-}" in
+      ""|--adopt) monitor_power "${2:-}" ;;
+      *) echo "omarchy-bluetooth-power: invalid monitor mode" >&2; exit 1 ;;
+    esac
     ;;
   *)
-    echo "Usage: omarchy-bluetooth-power <on|off|toggle|is-on|save|restore|monitor> [on|off]" >&2
+    echo "Usage: omarchy-bluetooth-power <on|off|toggle|is-on|save|restore|monitor> [on|off|--adopt]" >&2
     exit 1
     ;;
 esac

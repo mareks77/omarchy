@@ -73,7 +73,17 @@ cat >"$tmp/bin/systemctl" <<'SH'
 #!/bin/bash
 printf 'systemctl %s\n' "$*" >>"$MOCK_DIR/log"
 [[ -n ${MOCK_NO_SESSION:-} && $1 == --user ]] && exit 1
+if [[ -n ${MOCK_MONITOR_INACTIVE:-} ]]; then
+  [[ $* == '--user is-active --quiet omarchy-bluetooth-power.service' ]] && exit 1
+  [[ $* == '--user is-active --quiet omarchy-bluetooth-power-adopt.service' && ! -f $MOCK_DIR/adopt-started ]] && exit 1
+fi
 exit 0
+SH
+
+cat >"$tmp/bin/systemd-run" <<'SH'
+#!/bin/bash
+printf 'systemd-run %s\n' "$*" >>"$MOCK_DIR/log"
+touch "$MOCK_DIR/adopt-started"
 SH
 
 cat >"$tmp/bin/sudo" <<'SH'
@@ -97,7 +107,7 @@ chmod +x "$tmp/bin/"*
 reset_radio() {
   echo "$1" >"$tmp/hci0"
   echo none >"$tmp/block"
-  rm -f "$tmp/hci1" "$tmp/reject-once" "$tmp/bus-unavailable" "$tmp/adapter-unavailable" "$tmp/set-fail" "$state_file"
+  rm -f "$tmp/hci1" "$tmp/reject-once" "$tmp/bus-unavailable" "$tmp/adapter-unavailable" "$tmp/set-fail" "$tmp/adopt-started" "$state_file"
   : >"$tmp/log"
 }
 
@@ -245,6 +255,17 @@ assert_saved off
 [[ $(cat "$tmp/hci0") == true ]] || fail "migration interrupts active Bluetooth use"
 ! grep -Eq '^systemctl --user (start|restart)' "$tmp/log" || fail "migration starts or restarts a monitor over an active session"
 pass "migration enables next login without reapplying stale off in the live session"
+! grep -q '^systemd-run ' "$tmp/log" || fail "migration replaces an already running monitor"
+
+reset_radio true
+omarchy-bluetooth-power save off
+MOCK_MONITOR_INACTIVE=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+MOCK_MONITOR_INACTIVE=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+[[ $(grep -c '^systemd-run ' "$tmp/log") == 1 ]] || fail "migration duplicates the update-session monitor"
+grep -q '^systemd-run .*--collect.*--unit=omarchy-bluetooth-power-adopt.service.*--property=After=graphical-session.target.*--property=PartOf=graphical-session.target.*monitor --adopt$' "$tmp/log" || fail "migration monitor is not transient, session-bound and adopt-only"
+[[ $(cat "$tmp/hci0") == true ]] || fail "adopting an update session changes live power"
+assert_saved off
+pass "migration launches one snapshot-only session-bound monitor without replacing an existing one"
 
 reset_radio false
 echo soft >"$tmp/block"
@@ -338,6 +359,30 @@ wait_monitor_ready
 ! grep -q 'set-property.*Powered b false' "$tmp/log" || fail "restart reapplies the old off preference"
 stop_monitor
 pass "restart snapshots live application power instead of reapplying stale off"
+
+reset_radio true
+omarchy-bluetooth-power save off
+: >"$tmp/log"
+omarchy-bluetooth-power monitor --adopt >/dev/null 2>&1 &
+monitor_pid=$!
+wait_monitor_ready
+[[ $(cat "$tmp/hci0") == true ]] || fail "adopt mode restores stale off over a live connection"
+! grep -q 'set-property' "$tmp/log" || fail "adopt mode writes radio power"
+stop_monitor
+assert_saved on
+pass "update-session adoption captures current power without restoring stale preferences"
+
+reset_radio false
+omarchy-bluetooth-power save off
+touch "$tmp/bus-unavailable"
+omarchy-bluetooth-power monitor --adopt >/dev/null 2>&1 &
+monitor_pid=$!
+wait_monitor_ready
+rm "$tmp/bus-unavailable"
+busctl --system set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b true
+stop_monitor
+assert_saved on
+pass "update-session adoption snapshots later application changes after delayed Bluetooth startup"
 
 reset_radio false
 touch "$tmp/bus-unavailable"

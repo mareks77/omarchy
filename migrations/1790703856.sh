@@ -14,11 +14,20 @@ if [[ ! -e $state_file ]]; then
   fi
 fi
 
-# Enable for the next graphical login without starting or restarting a monitor
-# in the current session: its saved state may predate an application's power-on.
-# A running monitor continues unchanged. No user manager means writing the
-# wants symlink for next login instead.
-if ! systemctl --user daemon-reload || ! systemctl --user enable omarchy-bluetooth-power.service; then
+# Enable restoration for the next login. Adopt an already running session with
+# a transient snapshot-only monitor: never apply old preferences over a live
+# connection, and do not leave subsequent application changes unsaved either.
+if systemctl --user daemon-reload && systemctl --user enable omarchy-bluetooth-power.service; then
+  if systemctl --user is-active --quiet graphical-session.target &&
+    ! systemctl --user is-active --quiet omarchy-bluetooth-power.service &&
+    ! systemctl --user is-active --quiet omarchy-bluetooth-power-adopt.service; then
+    systemd-run --user --collect --unit=omarchy-bluetooth-power-adopt.service \
+      --property=After=graphical-session.target \
+      --property=PartOf=graphical-session.target \
+      --property=Restart=on-failure \
+      /usr/bin/omarchy-bluetooth-power monitor --adopt
+  fi
+else
   wants_dir="$HOME/.config/systemd/user/graphical-session.target.wants"
   mkdir -p "$wants_dir"
   ln -sfn /usr/lib/systemd/user/omarchy-bluetooth-power.service "$wants_dir/omarchy-bluetooth-power.service"
