@@ -95,6 +95,40 @@ power_off() {
   set_power off && remember off
 }
 
+monitor_power() {
+  local restored=false sleep_pid=""
+
+  cleanup_monitor() {
+    local state
+    if [[ -n $sleep_pid ]]; then
+      kill "$sleep_pid" 2>/dev/null || true
+      wait "$sleep_pid" 2>/dev/null || true
+    fi
+    # A temporary off state while restoration is pending is not a new choice.
+    # The process owns this flag, so every normal stop/restart uses the same
+    # guard instead of an unconditional systemd ExecStop snapshot.
+    if [[ $restored == "true" ]]; then
+      state=$(power_state) && remember "$state"
+    fi
+  }
+  trap cleanup_monitor EXIT
+  trap 'exit 0' TERM INT
+
+  if [[ -f $STATE_FILE ]]; then
+    until power_state >/dev/null && restore_power; do
+      sleep 2
+    done
+  fi
+  restored=true
+
+  # A background wait lets TERM run cleanup immediately without losing the
+  # restoration flag to exec, or waiting forever for a foreground sleep.
+  sleep infinity &
+  sleep_pid=$!
+  wait "$sleep_pid"
+  exit $?
+}
+
 case "${1:-}" in
   on)
     power_on
@@ -131,12 +165,7 @@ case "${1:-}" in
     # Type=simple keeps the unit active (including its logout snapshot) even
     # when BlueZ is initially unavailable. Retry until the preference can be
     # restored; do not force bluetoothd to start or lift external radio blocks.
-    if [[ -f $STATE_FILE ]]; then
-      until power_state >/dev/null && restore_power; do
-        sleep 2
-      done
-    fi
-    exec sleep infinity
+    monitor_power
     ;;
   *)
     echo "Usage: omarchy-bluetooth-power <on|off|toggle|is-on|save|restore|monitor> [on|off]" >&2

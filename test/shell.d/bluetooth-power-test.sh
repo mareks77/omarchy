@@ -87,6 +87,11 @@ cat >"$tmp/bin/mv" <<'SH'
 [[ -n ${MOCK_RENAME_FAIL:-} ]] && exit 1
 /usr/bin/mv "$@"
 SH
+cat >"$tmp/bin/sleep" <<'SH'
+#!/bin/bash
+[[ $1 == infinity ]] && printf 'idle %s\n' "$PPID" >>"$MOCK_DIR/log"
+exec /usr/bin/sleep "$@"
+SH
 chmod +x "$tmp/bin/"*
 
 reset_radio() {
@@ -233,6 +238,14 @@ assert_saved on
 [[ -L $HOME/.config/systemd/user/graphical-session.target.wants/omarchy-bluetooth-power.service ]] || fail "migration without a user manager enables next login"
 pass "migration preserves on and enables restoration without a user manager"
 
+reset_radio true
+omarchy-bluetooth-power save off # An application has since powered Bluetooth on.
+bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+assert_saved off
+[[ $(cat "$tmp/hci0") == true ]] || fail "migration interrupts active Bluetooth use"
+! grep -Eq '^systemctl --user (start|restart)' "$tmp/log" || fail "migration starts or restarts a monitor over an active session"
+pass "migration enables next login without reapplying stale off in the live session"
+
 reset_radio false
 echo soft >"$tmp/block"
 MOCK_BUS_DOWN=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
@@ -257,9 +270,16 @@ wait_for_off() {
   fail "monitor restores off after availability returns"
 }
 
+wait_monitor_ready() {
+  for (( attempt=0; attempt<100; attempt++ )); do
+    grep -qx "idle $monitor_pid" "$tmp/log" && return 0
+    sleep 0.1
+  done
+  fail "monitor reaches the post-restoration wait"
+}
+
 stop_monitor() {
-  # systemd runs ExecStop while the Type=simple process is still alive.
-  omarchy-bluetooth-power save
+  # systemd's normal stop sends TERM; the process decides whether to snapshot.
   kill "$monitor_pid"
   wait "$monitor_pid" || true
   monitor_pid=""
@@ -276,6 +296,7 @@ for unavailable in bus-unavailable adapter-unavailable set-fail; do
   [[ $(cat "$tmp/hci0") == true ]] || fail "monitor changes power before $unavailable is resolved"
   rm "$tmp/$unavailable"
   wait_for_off
+  wait_monitor_ready
   kill -0 "$monitor_pid" || fail "monitor exits after restoration"
   busctl --system set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b true
   stop_monitor
@@ -283,11 +304,46 @@ for unavailable in bus-unavailable adapter-unavailable set-fail; do
   pass "session waits through $unavailable, restores and saves external changes at logout"
 done
 
+for pending in bus-unavailable set-fail soft-block; do
+  reset_radio false
+  omarchy-bluetooth-power save on
+  if [[ $pending == "soft-block" ]]; then
+    echo soft >"$tmp/block"
+  else
+    touch "$tmp/$pending"
+  fi
+  omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+  monitor_pid=$!
+  sleep 0.3
+  kill -0 "$monitor_pid" || fail "pending $pending monitor exits before stop"
+  stop_monitor
+  assert_saved on
+  [[ $(cat "$tmp/hci0") == false ]] || fail "pending $pending monitor changes the radio"
+  pass "stopping pending $pending restoration preserves the saved on preference"
+done
+
+reset_radio false
+omarchy-bluetooth-power save off
+omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+monitor_pid=$!
+wait_monitor_ready
+busctl --system set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b true
+stop_monitor
+assert_saved on
+: >"$tmp/log"
+omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+monitor_pid=$!
+wait_monitor_ready
+[[ $(cat "$tmp/hci0") == true ]] || fail "restarting a ready monitor interrupts an application's power-on"
+! grep -q 'set-property.*Powered b false' "$tmp/log" || fail "restart reapplies the old off preference"
+stop_monitor
+pass "restart snapshots live application power instead of reapplying stale off"
+
 reset_radio false
 touch "$tmp/bus-unavailable"
 omarchy-bluetooth-power monitor >/dev/null 2>&1 &
 monitor_pid=$!
-sleep 0.3
+wait_monitor_ready
 kill -0 "$monitor_pid" || fail "session without saved state exits when BlueZ is down"
 rm "$tmp/bus-unavailable"
 echo true >"$tmp/hci0"
@@ -296,9 +352,10 @@ assert_saved on
 pass "session without an initial preference still snapshots a late Bluetooth startup"
 
 unit="$ROOT/default/systemd/user/omarchy-bluetooth-power.service"
-for line in 'ExecStart=/usr/bin/omarchy-bluetooth-power monitor' 'ExecStop=/usr/bin/omarchy-bluetooth-power save' 'PartOf=graphical-session.target' 'After=graphical-session.target' 'Type=simple' 'Restart=on-failure' 'WantedBy=graphical-session.target'; do
+for line in 'ExecStart=/usr/bin/omarchy-bluetooth-power monitor' 'PartOf=graphical-session.target' 'After=graphical-session.target' 'Type=simple' 'Restart=on-failure' 'WantedBy=graphical-session.target'; do
   grep -qxF "$line" "$unit" || fail "Bluetooth state unit is missing $line"
 done
 ! grep -q '^ExecCondition=\|^ConditionPath' "$unit" || fail "session unit skips late Bluetooth availability"
+! grep -q '^ExecStop=' "$unit" || fail "session unit snapshots without the monitor's restoration guard"
 grep -qF 'omarchy-bluetooth-power.service' "$ROOT/install/user/first-run/enable-user-units.sh" || fail "first run enables Bluetooth state unit"
 pass "graphical session restores on login and saves on logout for new installs"
