@@ -24,6 +24,12 @@ while [[ $1 == --* ]]; do shift; done
 printf 'busctl %s\n' "$*" >>"$MOCK_DIR/log"
 [[ -n ${MOCK_BUS_DOWN:-} || -f $MOCK_DIR/bus-unavailable ]] && exit 1
 case "$1" in
+  call)
+    [[ $5 == GetNameOwner ]] || exit 1
+    owner=1
+    [[ ! -f $MOCK_DIR/bluez-owner ]] || owner=$(cat "$MOCK_DIR/bluez-owner")
+    printf 's ":1.%s"\n' "$owner"
+    ;;
   tree)
     [[ -n ${MOCK_NO_ADAPTERS:-} || -f $MOCK_DIR/adapter-unavailable ]] && exit 0
     printf '/org/bluez/hci0\n/org/bluez/hci0/dev_AA_BB\n'
@@ -132,6 +138,18 @@ cat >"$tmp/bin/mv" <<'SH'
 [[ -n ${MOCK_RENAME_FAIL:-} ]] && exit 1
 /usr/bin/mv "$@"
 SH
+cat >"$tmp/bin/stat" <<'SH'
+#!/bin/bash
+path=${@: -1}
+if [[ $path == /sys/class/bluetooth/hci* ]]; then
+  [[ -f $MOCK_DIR/${path##*/} ]] || exit 1
+  instance=1
+  [[ ! -f $MOCK_DIR/instance-${path##*/} ]] || instance=$(cat "$MOCK_DIR/instance-${path##*/}")
+  printf '1:%s\n' "$instance"
+else
+  /usr/bin/stat "$@"
+fi
+SH
 cat >"$tmp/bin/sleep" <<'SH'
 #!/bin/bash
 [[ $1 == infinity ]] && printf 'idle %s\n' "$PPID" >>"$MOCK_DIR/log"
@@ -143,7 +161,7 @@ chmod +x "$tmp/bin/"*
 reset_radio() {
   echo "$1" >"$tmp/hci0"
   echo none >"$tmp/block"
-  rm -f "$tmp/hci1" "$tmp"/block-hci* "$tmp"/address-hci* "$tmp/reject-once" "$tmp/bus-unavailable" "$tmp/adapter-unavailable" "$tmp/set-fail" "$tmp/adopt-started" "$state_file"
+  rm -f "$tmp/hci1" "$tmp"/block-hci* "$tmp"/address-hci* "$tmp"/instance-hci* "$tmp/bluez-owner" "$tmp/reject-once" "$tmp/bus-unavailable" "$tmp/adapter-unavailable" "$tmp/set-fail" "$tmp/adopt-started" "$state_file"
   : >"$tmp/log"
 }
 
@@ -526,6 +544,51 @@ stop_monitor
 assert_saved off
 assert_saved on 11:22:33:44:55:66
 pass "pending secondary restoration neither reapplies nor discards a ready primary's choice"
+
+for reconnect in replug daemon-restart; do
+  reset_radio true
+  echo false >"$tmp/hci1"
+  echo hard >"$tmp/block-hci1"
+  mkdir -p "$(dirname "$state_file")"
+  printf 'on\nAA:BB:CC:DD:EE:FF off\n' >"$state_file"
+  omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+  monitor_pid=$!
+  wait_monitor_retry 1
+  [[ $(cat "$tmp/hci0") == false ]] || fail "primary off is not restored"
+  # Reuse the address and hci index between polls; mere absence tracking cannot
+  # detect this. A daemon restart similarly leaves the kernel device unchanged.
+  if [[ $reconnect == "replug" ]]; then
+    echo 2 >"$tmp/instance-hci0"
+  else
+    echo 2 >"$tmp/bluez-owner"
+  fi
+  echo true >"$tmp/hci0"
+  wait_monitor_retry 2
+  [[ $(cat "$tmp/hci0") == false ]] || fail "$reconnect skips the saved off preference"
+  stop_monitor
+  assert_saved off
+  assert_saved on 11:22:33:44:55:66
+  pass "$reconnect invalidates readiness even with the same adapter address and index"
+done
+
+reset_radio true
+echo false >"$tmp/hci1"
+echo hard >"$tmp/block-hci1"
+printf 'on\nAA:BB:CC:DD:EE:FF off\n' >"$state_file"
+omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+monitor_pid=$!
+wait_monitor_retry 1
+# Keep the retrying parent stopped while the device instance changes so TERM
+# tests the snapshot guard itself, rather than the next restoration pass.
+kill -STOP "$monitor_pid"
+echo 2 >"$tmp/instance-hci0"
+echo true >"$tmp/hci0"
+kill -TERM "$monitor_pid"
+kill -CONT "$monitor_pid"
+wait "$monitor_pid" || true
+monitor_pid=""
+assert_saved off
+pass "stopping before a replug can be restored does not snapshot its AutoEnable on"
 
 reset_radio false
 echo hard >"$tmp/block"

@@ -58,6 +58,18 @@ adapter_address() {
   echo "${BASH_REMATCH[1]^^}"
 }
 
+bluez_owner() {
+  busctl --system --timeout=1 call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetNameOwner s org.bluez 2>/dev/null
+}
+
+adapter_instance() {
+  local inode
+  # kernfs gives each newly registered controller a new inode, even when a
+  # quick unplug/replug reuses both its address and hci number between retries.
+  inode=$(stat -Lc '%d:%i' "/sys/class/bluetooth/${1##*/}" 2>/dev/null) || return 1
+  printf '%s %s\n' "$1" "$inode"
+}
+
 read_preferences() {
   local address direction extra
   default_preference=on
@@ -80,12 +92,15 @@ read_preferences() {
 }
 
 snapshot_power() {
-  local scope=${1:-all} adapters adapter address value device soft hard extra switches changed=false global_block=false
+  local scope=${1:-all} adapters adapter address value device soft hard extra switches owner instance changed=false global_block=false
   local -A blocked=()
   local -a records=()
   read_preferences || return 1
   adapters=$(controllers) || return 0
   [[ -n $adapters ]] || return 0
+  if [[ $scope == "ready" ]]; then
+    owner=$(bluez_owner) || return 0
+  fi
 
   switches=$(LC_ALL=C rfkill --raw --noheadings --output DEVICE,SOFT,HARD list bluetooth 2>/dev/null) || switches=""
   while read -r device soft hard extra; do
@@ -104,7 +119,10 @@ snapshot_power() {
     # Pending restoration on one adapter must not discard choices made on an
     # independently ready adapter. Blocked/unreadable adapters keep their own
     # saved override (or the legacy default), not another adapter's state.
-    [[ $scope == "ready" && ${ready[$address]:-} != "true" ]] && continue
+    if [[ $scope == "ready" ]]; then
+      instance=$(adapter_instance "$adapter") || continue
+      [[ ${ready[$address]:-} == "$owner $instance" ]] || continue
+    fi
     value=$(busctl --system --timeout=1 get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null) || continue
     if [[ $value == "b true" ]]; then
       preferences[$address]=on
@@ -157,7 +175,7 @@ set_power() {
 }
 
 restore_power() {
-  local adapters adapter address direction confirmed=true
+  local adapters adapter address direction owner instance confirmed=true
   if ! read_preferences; then
     echo "omarchy-bluetooth-power: invalid saved state" >&2
     return 1
@@ -165,18 +183,27 @@ restore_power() {
   [[ -f $STATE_FILE ]] || return 0
   adapters=$(controllers) || return 1
   [[ -n $adapters ]] || return 1
+  if [[ ${1:-} == "--track" ]]; then
+    owner=$(bluez_owner) || return 1
+  fi
 
   for adapter in $adapters; do
     if ! address=$(adapter_address "$adapter"); then
       confirmed=false
       continue
     fi
-    # Do not reapply a ready adapter's preference while a different adapter is
-    # still blocked: applications may have legitimately changed the ready one.
-    [[ ${1:-} == "--track" && ${ready[$address]:-} == "true" ]] && continue
+    # Skip ordinary application changes on a ready adapter, but reapply after
+    # a replug or bluetoothd restart creates a new controller instance.
+    if [[ ${1:-} == "--track" ]]; then
+      if ! instance=$(adapter_instance "$adapter"); then
+        confirmed=false
+        continue
+      fi
+      [[ ${ready[$address]:-} == "$owner $instance" ]] && continue
+    fi
     direction=${preferences[$address]:-$default_preference}
     if set_adapter_power "$adapter" "$direction"; then
-      [[ ${1:-} != "--track" ]] || ready[$address]=true
+      [[ ${1:-} != "--track" ]] || ready[$address]="$owner $instance"
     else
       confirmed=false
     fi
