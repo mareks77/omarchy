@@ -1,66 +1,87 @@
 #!/bin/bash
 
-# omarchy:summary=Turn Bluetooth on or off, remembered across reboots
+# omarchy:summary=Turn Bluetooth on or off, remembered at login
 # omarchy:group=bluetooth
-# omarchy:args=<on|off|toggle|is-on>
+# omarchy:args=<on|off|toggle|is-on|save|restore>
 
-# BlueZ never persists an adapter's Powered property, so turning Bluetooth off
-# through bluetoothctl lasts only until the next boot. The rfkill soft block does
-# persist: systemd-rfkill saves every switch under /var/lib/systemd/rfkill and
-# restores it early on the next boot, which is its entire job. Blocking is also
-# what the kernel hands every radio at once, so a machine with two controllers
-# gets both, where bluetoothctl only ever addresses the default one.
-#
-# So the block is the state, and BlueZ follows it: unblocking leaves AutoEnable
-# at its stock default and bluetoothd powers the adapter up by itself. Every
-# Omarchy path that turns Bluetooth on or off goes through here, because a plain
-# `bluetoothctl power on` fails outright while the block is set.
+# Normal off is BlueZ Powered=false, not an rfkill block: applications such as
+# Chromium can set Powered=true, but cannot lift the block for a phone passkey.
+# Persist the preference separately and restore it in the graphical session.
+set -o pipefail
 
-POWER_WAIT_SECONDS=${OMARCHY_BLUETOOTH_POWER_WAIT_SECONDS:-2}
+POWER_WAIT_SECONDS=${OMARCHY_BLUETOOTH_POWER_WAIT_SECONDS:-5}
+STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/bluetooth-power"
 
 controllers() {
-  timeout 2s bluetoothctl list 2>/dev/null | awk '{print $2}'
+  busctl --system --timeout=1 tree org.bluez --list 2>/dev/null |
+    awk '/^\/org\/bluez\/hci[0-9]+$/'
 }
 
-# Any controller counts. The block is all-or-nothing across the radios, so the
-# state has to be read the same way; a bare `bluetoothctl show` would report the
-# default controller and miss a powered dongle sitting behind it.
-powered() {
-  local controller
+# Any powered controller counts as on, but missing hardware or an unavailable
+# bus is not an off preference: never overwrite saved state with either.
+power_state() {
+  local adapters adapter value state=off
+  adapters=$(controllers) || return 1
+  [[ -n $adapters ]] || return 1
 
-  for controller in $(controllers); do
-    [[ $(timeout 2s bluetoothctl show "$controller" 2>/dev/null) == *"Powered: yes"* ]] && return 0
+  for adapter in $adapters; do
+    value=$(busctl --system --timeout=1 get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null) || return 1
+    case "$value" in
+      "b true") state=on ;;
+      "b false") ;;
+      *) return 1 ;;
+    esac
   done
 
-  return 1
+  echo "$state"
 }
 
-# One deadline around the whole wait rather than a fixed number of probes: every
-# probe can sit on its own timeout when D-Bus is wedged, and counting probes then
-# stretches a two-second wait into half a minute.
-wait_powered() {
-  local deadline=$((SECONDS + POWER_WAIT_SECONDS))
+remember() {
+  local staged
+  mkdir -p "$(dirname "$STATE_FILE")" || return 1
+  staged=$(mktemp "$STATE_FILE.XXXXXX") || return 1
+  if printf '%s\n' "$1" >"$staged" && mv -f "$staged" "$STATE_FILE"; then
+    return 0
+  else
+    rm -f "$staged"
+    return 1
+  fi
+}
 
+set_power() {
+  local direction=$1 value=false adapters adapter confirmed deadline=$((SECONDS + POWER_WAIT_SECONDS))
+  [[ $direction == "on" ]] && value=true
+  adapters=$(controllers) || return 1
+  [[ -n $adapters ]] || return 1
+
+  # Address every adapter, not just bluetoothctl's default. Retry during BlueZ
+  # transitions (notably AutoEnable after lifting an old rfkill block), and
+  # confirm the requested state before recording a successful change.
   while :; do
-    powered && return 0
-    ((SECONDS < deadline)) || return 1
+    confirmed=true
+    for adapter in $adapters; do
+      if [[ $(busctl --system --timeout=1 get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null) != "b $value" ]]; then
+        busctl --system --timeout=1 set-property org.bluez "$adapter" org.bluez.Adapter1 Powered b "$value" >/dev/null 2>&1 || true
+        [[ $(busctl --system --timeout=1 get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null) == "b $value" ]] || confirmed=false
+      fi
+    done
+    [[ $confirmed == "true" ]] && return 0
+    ((SECONDS < deadline)) || break
     sleep 0.2
   done
+
+  echo "omarchy-bluetooth-power: adapter did not turn $direction" >&2
+  return 1
 }
 
 power_on() {
-  rfkill unblock bluetooth
+  # Explicitly turning on in Omarchy can still recover a software block set by
+  # another tool. Restoring a preference at login must not override that block.
+  rfkill unblock bluetooth && set_power on && remember on
+}
 
-  # Usually all it takes: with AutoEnable at its default, bluetoothd powers the
-  # adapter up on its own once the block is gone. It will not do that for an
-  # adapter powered down without a block, so ask directly before giving up.
-  wait_powered && return 0
-
-  timeout 5s bluetoothctl power on >/dev/null 2>&1
-  wait_powered && return 0
-
-  echo "omarchy-bluetooth-power: adapter did not come up" >&2
-  return 1
+power_off() {
+  set_power off && remember off
 }
 
 case "${1:-}" in
@@ -68,22 +89,37 @@ case "${1:-}" in
     power_on
     ;;
   off)
-    # No bluetoothctl power off to go with this: the block already drops the
-    # adapter to Powered: no, and it is the half that survives the reboot.
-    rfkill block bluetooth
+    power_off
     ;;
   toggle)
-    if powered; then
-      rfkill block bluetooth
+    if [[ $(power_state) == "on" ]]; then
+      power_off
     else
       power_on
     fi
     ;;
   is-on)
-    powered
+    [[ $(power_state) == "on" ]]
+    ;;
+  save)
+    # Snapshot at logout also remembers power changes made by other clients.
+    state=$(power_state) || exit 0
+    remember "$state"
+    ;;
+  restore)
+    [[ -f $STATE_FILE ]] || exit 0
+    read -r state <"$STATE_FILE" || exit 1
+    case "$state" in
+      on|off)
+        # A saved preference can outlive a USB adapter or an available daemon.
+        power_state >/dev/null || exit 0
+        set_power "$state"
+        ;;
+      *) echo "omarchy-bluetooth-power: invalid saved state" >&2; exit 1 ;;
+    esac
     ;;
   *)
-    echo "Usage: omarchy-bluetooth-power <on|off|toggle|is-on>" >&2
+    echo "Usage: omarchy-bluetooth-power <on|off|toggle|is-on|save|restore>" >&2
     exit 1
     ;;
 esac

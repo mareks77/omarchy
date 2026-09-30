@@ -1,0 +1,15 @@
+[Unit]
+Description=Restore and save Bluetooth power preference
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionPathIsDirectory=/sys/class/bluetooth
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecCondition=/usr/bin/systemctl is-active --quiet bluetooth.service
+ExecStart=/usr/bin/omarchy-bluetooth-power restore
+ExecStop=/usr/bin/omarchy-bluetooth-power save
+
+[Install]
+WantedBy=graphical-session.target
