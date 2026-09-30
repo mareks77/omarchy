@@ -31,7 +31,18 @@ case "$1" in
     ;;
   get-property)
     [[ -n ${MOCK_READ_FAIL:-} ]] && exit 1
-    printf 'b %s\n' "$(cat "$MOCK_DIR/${3##*/}")"
+    if [[ $5 == Address ]]; then
+      if [[ -f $MOCK_DIR/address-${3##*/} ]]; then
+        address=$(cat "$MOCK_DIR/address-${3##*/}")
+      elif [[ ${3##*/} == hci0 ]]; then
+        address=AA:BB:CC:DD:EE:FF
+      else
+        address=11:22:33:44:55:66
+      fi
+      printf 's "%s"\n' "$address"
+    else
+      printf 'b %s\n' "$(cat "$MOCK_DIR/${3##*/}")"
+    fi
     ;;
   set-property)
     [[ -n ${MOCK_SET_FAIL:-} || -f $MOCK_DIR/set-fail ]] && exit 1
@@ -39,7 +50,10 @@ case "$1" in
       rm "$MOCK_DIR/reject-once"
       exit 1
     fi
-    [[ $7 == true && $(cat "$MOCK_DIR/block") != none ]] && exit 1
+    block=none
+    [[ ${3##*/} != hci0 ]] || block=$(cat "$MOCK_DIR/block")
+    [[ ! -f $MOCK_DIR/block-${3##*/} ]] || block=$(cat "$MOCK_DIR/block-${3##*/}")
+    [[ $7 == true && $block != none ]] && exit 1
     echo "$7" >"$MOCK_DIR/${3##*/}"
     ;;
 esac
@@ -51,20 +65,30 @@ cat >"$tmp/bin/rfkill" <<'SH'
 printf 'rfkill %s\n' "$*" >>"$MOCK_DIR/log"
 if [[ $1 == unblock ]]; then
   [[ -n ${MOCK_UNBLOCK_FAIL:-} ]] && exit 1
-  [[ $(cat "$MOCK_DIR/block") == soft ]] && echo none >"$MOCK_DIR/block"
+  for file in "$MOCK_DIR/block" "$MOCK_DIR"/block-hci*; do
+    [[ ! -f $file || $(cat "$file") != soft ]] || echo none >"$file"
+  done
 elif [[ $1 == --raw ]]; then
   [[ -n ${MOCK_RFKILL_READ_FAIL:-} ]] && exit 1
-  soft=unblocked hard=unblocked
-  case "$(cat "$MOCK_DIR/block")" in
-    soft) soft=blocked ;;
-    hard) hard=blocked ;;
-  esac
-  if [[ $* == *'--output SOFT,HARD'* ]]; then
-    printf '%s %s\n' "$soft" "$hard"
-    [[ -n ${MOCK_SECONDARY_BLOCK:-} ]] && echo 'unblocked blocked'
-  else
-    echo "$soft"
-  fi
+  for device in hci0 hci1; do
+    [[ $device == hci0 || -f $MOCK_DIR/hci1 || -n ${MOCK_SECONDARY_BLOCK:-} ]] || continue
+    block=none
+    [[ $device != hci0 ]] || block=$(cat "$MOCK_DIR/block")
+    [[ ! -f $MOCK_DIR/block-$device ]] || block=$(cat "$MOCK_DIR/block-$device")
+    [[ $device != hci1 || -z ${MOCK_SECONDARY_BLOCK:-} ]] || block=hard
+    soft=unblocked hard=unblocked
+    case "$block" in
+      soft) soft=blocked ;;
+      hard) hard=blocked ;;
+    esac
+    if [[ $* == *'--output DEVICE,SOFT,HARD'* ]]; then
+      printf '%s %s %s\n' "$device" "$soft" "$hard"
+    elif [[ $* == *'--output SOFT,HARD'* ]]; then
+      printf '%s %s\n' "$soft" "$hard"
+    else
+      echo "$soft"
+    fi
+  done
 else
   echo "unexpected rfkill operation" >&2
   exit 1
@@ -111,6 +135,7 @@ SH
 cat >"$tmp/bin/sleep" <<'SH'
 #!/bin/bash
 [[ $1 == infinity ]] && printf 'idle %s\n' "$PPID" >>"$MOCK_DIR/log"
+[[ $1 == 2 ]] && printf 'retry %s\n' "$PPID" >>"$MOCK_DIR/log"
 exec /usr/bin/sleep "$@"
 SH
 chmod +x "$tmp/bin/"*
@@ -118,12 +143,14 @@ chmod +x "$tmp/bin/"*
 reset_radio() {
   echo "$1" >"$tmp/hci0"
   echo none >"$tmp/block"
-  rm -f "$tmp/hci1" "$tmp/reject-once" "$tmp/bus-unavailable" "$tmp/adapter-unavailable" "$tmp/set-fail" "$tmp/adopt-started" "$state_file"
+  rm -f "$tmp/hci1" "$tmp"/block-hci* "$tmp"/address-hci* "$tmp/reject-once" "$tmp/bus-unavailable" "$tmp/adapter-unavailable" "$tmp/set-fail" "$tmp/adopt-started" "$state_file"
   : >"$tmp/log"
 }
 
 assert_saved() {
-  [[ $(cat "$state_file") == "$1" ]] || fail "saved Bluetooth preference is $1"
+  local address=${2:-AA:BB:CC:DD:EE:FF} actual
+  actual=$(awk -v address="${address^^}" 'NR == 1 { state = $0 } toupper($1) == address { state = $2 } END { print state }' "$state_file")
+  [[ $actual == "$1" ]] || fail "saved Bluetooth preference for $address is $1 (got $actual)"
 }
 
 reset_radio true
@@ -213,6 +240,13 @@ if omarchy-bluetooth-power restore 2>/dev/null; then fail "invalid state is reje
 ! grep -q 'set-property' "$tmp/log" || fail "invalid state causes a power change"
 pass "absent or invalid state is never executed as a power direction"
 
+for record in 'invalid off' 'AA:BB:CC:DD:EE:FF invalid' 'AA:BB:CC:DD:EE:FF off extra' $'AA:BB:CC:DD:EE:FF off\naa:bb:cc:dd:ee:ff on'; do
+  printf 'on\n%s\n' "$record" >"$state_file"
+  if omarchy-bluetooth-power restore 2>/dev/null; then fail "invalid adapter override is accepted"; fi
+  ! grep -q 'set-property' "$tmp/log" || fail "invalid overrides change power"
+done
+pass "invalid, duplicate and extra-token adapter overrides are rejected before power changes"
+
 reset_radio false
 touch "$tmp/reject-once"
 OMARCHY_BLUETOOTH_POWER_WAIT_SECONDS=2 omarchy-bluetooth-power on
@@ -258,6 +292,16 @@ MOCK_NO_SESSION=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
 assert_saved on
 [[ -L $HOME/.config/systemd/user/graphical-session.target.wants/omarchy-bluetooth-power.service ]] || fail "migration without a user manager enables next login"
 pass "migration preserves on and enables restoration without a user manager"
+
+reset_radio true
+echo false >"$tmp/hci1"
+echo soft >"$tmp/block-hci1"
+MOCK_NO_SESSION=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+assert_saved on
+[[ $(cat "$tmp/block-hci1") == soft ]] || fail "migration unblocks secondary adapter"
+omarchy-bluetooth-power restore >/dev/null 2>&1 || true
+[[ $(cat "$tmp/hci0") == true ]] || fail "mixed-adapter migration powers off primary at next login"
+pass "migration preserves a powered primary alongside a blocked secondary adapter"
 
 reset_radio true
 omarchy-bluetooth-power save off # An application has since powered Bluetooth on.
@@ -308,6 +352,14 @@ wait_monitor_ready() {
     sleep 0.1
   done
   fail "monitor reaches the post-restoration wait"
+}
+
+wait_monitor_retry() {
+  for (( attempt=0; attempt<100; attempt++ )); do
+    [[ $(grep -cx "retry $monitor_pid" "$tmp/log" || true) -ge $1 ]] && return 0
+    sleep 0.1
+  done
+  fail "monitor retries pending adapter restoration"
 }
 
 stop_monitor() {
@@ -427,12 +479,78 @@ pass "unreadable rfkill state cannot become a saved off preference"
 
 echo false >"$tmp/hci1"
 MOCK_SECONDARY_BLOCK=1 omarchy-bluetooth-power save
-assert_saved on
+assert_saved off
+assert_saved on 11:22:33:44:55:66
 rm "$tmp/hci1"
 # Exact blocked-token matching must not reject the ordinary unblocked state.
 omarchy-bluetooth-power save
 assert_saved off
 pass "secondary controller blocks are respected and genuine unblocked off is saved"
+
+for block in soft hard; do
+  reset_radio true
+  echo false >"$tmp/hci1"
+  echo "$block" >"$tmp/block-hci1"
+  omarchy-bluetooth-power save on
+  omarchy-bluetooth-power monitor --adopt >/dev/null 2>&1 &
+  monitor_pid=$!
+  wait_monitor_ready
+  busctl --system set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b false
+  stop_monitor
+  assert_saved off
+  assert_saved on 11:22:33:44:55:66
+  echo none >"$tmp/block-hci1"
+  echo true >"$tmp/hci0"
+  omarchy-bluetooth-power restore
+  [[ $(cat "$tmp/hci0") == false && $(cat "$tmp/hci1") == true ]] || fail "login forgets an independent client power-off"
+  # Controller indices are not stable across boots; addresses are.
+  echo 11:22:33:44:55:66 >"$tmp/address-hci0"
+  echo AA:BB:CC:DD:EE:FF >"$tmp/address-hci1"
+  omarchy-bluetooth-power restore
+  [[ $(cat "$tmp/hci0") == true && $(cat "$tmp/hci1") == false ]] || fail "adapter renumbering swaps preferences"
+  pass "client off survives a secondary $block block and adapter renumbering"
+done
+
+reset_radio false
+echo false >"$tmp/hci1"
+echo hard >"$tmp/block-hci1"
+omarchy-bluetooth-power save on
+omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+monitor_pid=$!
+wait_monitor_retry 1
+[[ $(cat "$tmp/hci0") == true ]] || fail "primary not restored independently"
+busctl --system set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b false
+wait_monitor_retry 2
+[[ $(cat "$tmp/hci0") == false ]] || fail "secondary retry overwrites primary client choice"
+stop_monitor
+assert_saved off
+assert_saved on 11:22:33:44:55:66
+pass "pending secondary restoration neither reapplies nor discards a ready primary's choice"
+
+reset_radio false
+echo hard >"$tmp/block"
+echo false >"$tmp/hci1"
+omarchy-bluetooth-power save on
+omarchy-bluetooth-power save
+assert_saved on
+assert_saved off 11:22:33:44:55:66
+cp "$state_file" "$tmp/previous-state"
+if MOCK_RENAME_FAIL=1 omarchy-bluetooth-power save; then fail "failed adapter snapshot is reported"; fi
+cmp -s "$state_file" "$tmp/previous-state" || fail "atomic failure damages adapter records"
+rm "$tmp/hci1"
+omarchy-bluetooth-power save
+assert_saved off 11:22:33:44:55:66
+pass "primary blocks, unplugged adapters and atomic failures preserve independent preferences"
+
+reset_radio true
+omarchy-bluetooth-power save on
+omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+monitor_pid=$!
+wait_monitor_ready
+echo false >"$tmp/hci1"
+stop_monitor
+assert_saved off 11:22:33:44:55:66
+pass "a late-plugged adapter is captured after initial restoration completes"
 
 reset_radio false
 omarchy-bluetooth-power save off

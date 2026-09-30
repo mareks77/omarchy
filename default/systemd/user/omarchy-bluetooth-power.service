@@ -8,7 +8,7 @@ PartOf=graphical-session.target
 # bluetoothd or a USB adapter becomes available after graphical login.
 Type=simple
 ExecStart=/usr/bin/omarchy-bluetooth-power monitor
-# The monitor snapshots on TERM only after restoration completes.
+# On TERM, snapshot ready adapters without replacing pending preferences.
 Restart=on-failure
 RestartSec=2
 

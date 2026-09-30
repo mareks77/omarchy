@@ -4,10 +4,15 @@ state_file="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/bluetooth-power"
 
 # Old Omarchy off and an external airplane-mode block are indistinguishable.
 # Preserve every existing block; only an explicit Omarchy on may clear it.
-# Capture off through the helper's atomic write even if BlueZ is unavailable.
+# Capture off through the helper's atomic write even if BlueZ is unavailable,
+# but do not let a blocked secondary radio turn off a powered primary at login.
 if [[ ! -e $state_file ]]; then
   if rfkill --raw --noheadings --output SOFT list bluetooth | grep -qx blocked; then
-    omarchy-bluetooth-power save off
+    if omarchy-bluetooth-power is-on; then
+      omarchy-bluetooth-power save
+    else
+      omarchy-bluetooth-power save off
+    fi
     echo "Existing Bluetooth blocks are preserved. Enable Bluetooth once in Omarchy to allow application power-on."
   else
     omarchy-bluetooth-power save

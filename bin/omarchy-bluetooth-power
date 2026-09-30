@@ -12,6 +12,8 @@ set -o pipefail
 
 POWER_WAIT_SECONDS=${OMARCHY_BLUETOOTH_POWER_WAIT_SECONDS:-5}
 STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/bluetooth-power"
+declare -A preferences=()
+default_preference=on
 
 controllers() {
   busctl --system --timeout=1 tree org.bluez --list 2>/dev/null |
@@ -41,7 +43,7 @@ remember() {
   local staged
   mkdir -p "$(dirname "$STATE_FILE")" || return 1
   staged=$(mktemp "$STATE_FILE.XXXXXX") || return 1
-  if printf '%s\n' "$1" >"$staged" && mv -f "$staged" "$STATE_FILE"; then
+  if printf '%s\n' "$@" >"$staged" && mv -f "$staged" "$STATE_FILE"; then
     return 0
   else
     rm -f "$staged"
@@ -49,24 +51,91 @@ remember() {
   fi
 }
 
+adapter_address() {
+  local value
+  value=$(busctl --system --timeout=1 get-property org.bluez "$1" org.bluez.Adapter1 Address 2>/dev/null) || return 1
+  [[ $value =~ ^s\ \"(([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})\"$ ]] || return 1
+  echo "${BASH_REMATCH[1]^^}"
+}
+
+read_preferences() {
+  local address direction extra
+  default_preference=on
+  preferences=()
+  [[ -f $STATE_FILE ]] || return 0
+
+  # The first line remains compatible with the old single on/off preference.
+  # Snapshots add per-address overrides; hci numbers can change across boots.
+  {
+    read -r default_preference || [[ -n $default_preference ]] || return 1
+    [[ $default_preference == "on" || $default_preference == "off" ]] || return 1
+    while read -r address direction extra || [[ -n $address ]]; do
+      [[ $address =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ && -z $extra ]] || return 1
+      [[ $direction == "on" || $direction == "off" ]] || return 1
+      address=${address^^}
+      [[ ! -v preferences[$address] ]] || return 1
+      preferences[$address]=$direction
+    done
+  } <"$STATE_FILE"
+}
+
 snapshot_power() {
-  local state blocks
-  state=$(power_state) || return 0
+  local scope=${1:-all} adapters adapter address value device soft hard extra switches changed=false global_block=false
+  local -A blocked=()
+  local -a records=()
+  read_preferences || return 1
+  adapters=$(controllers) || return 0
+  [[ -n $adapters ]] || return 0
 
-  # A radio restriction is not a new off preference, including in adopt mode
-  # where restoration was deliberately skipped. If any controller is blocked
-  # (or its rfkill state cannot be read), preserve the saved preference.
-  if [[ $state == "off" ]]; then
-    blocks=$(LC_ALL=C rfkill --raw --noheadings --output SOFT,HARD list bluetooth 2>/dev/null) || return 0
-    [[ $blocks =~ (^|[[:space:]])blocked($|[[:space:]]) ]] && return 0
+  switches=$(LC_ALL=C rfkill --raw --noheadings --output DEVICE,SOFT,HARD list bluetooth 2>/dev/null) || switches=""
+  while read -r device soft hard extra; do
+    [[ -n $device && -z $extra && ( $soft == "blocked" || $soft == "unblocked" ) && ( $hard == "blocked" || $hard == "unblocked" ) ]] || continue
+    if [[ $soft == "blocked" || $hard == "blocked" ]]; then
+      blocked[$device]=true
+      # An unmapped platform switch may constrain every controller.
+      [[ $device =~ ^hci[0-9]+$ ]] || global_block=true
+    else
+      blocked[$device]=false
+    fi
+  done <<<"$switches"
+
+  for adapter in $adapters; do
+    address=$(adapter_address "$adapter") || continue
+    # Pending restoration on one adapter must not discard choices made on an
+    # independently ready adapter. Blocked/unreadable adapters keep their own
+    # saved override (or the legacy default), not another adapter's state.
+    [[ $scope == "ready" && ${ready[$address]:-} != "true" ]] && continue
+    value=$(busctl --system --timeout=1 get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null) || continue
+    if [[ $value == "b true" ]]; then
+      preferences[$address]=on
+    elif [[ $value == "b false" && $global_block == "false" && ${blocked[${adapter##*/}]:-unknown} == "false" ]]; then
+      preferences[$address]=off
+    else
+      continue
+    fi
+    changed=true
+  done
+  [[ $changed == "true" ]] || return 0
+
+  mapfile -t records < <(
+    for address in "${!preferences[@]}"; do
+      printf '%s %s\n' "$address" "${preferences[$address]}"
+    done | LC_ALL=C sort
+  )
+  remember "$default_preference" "${records[@]}"
+}
+
+set_adapter_power() {
+  local adapter=$1 direction=$2 value=false
+  [[ $direction == "on" ]] && value=true
+  if [[ $(busctl --system --timeout=1 get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null) != "b $value" ]]; then
+    busctl --system --timeout=1 set-property org.bluez "$adapter" org.bluez.Adapter1 Powered b "$value" >/dev/null 2>&1 || return 1
   fi
-
-  remember "$state"
+  [[ $(busctl --system --timeout=1 get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null) == "b $value" ]]
 }
 
 set_power() {
-  local direction=$1 value=false adapters adapter confirmed deadline=$((SECONDS + POWER_WAIT_SECONDS))
-  [[ $direction == "on" ]] && value=true
+  local direction=$1 adapters adapter confirmed deadline=$((SECONDS + POWER_WAIT_SECONDS))
   adapters=$(controllers) || return 1
   [[ -n $adapters ]] || return 1
 
@@ -76,10 +145,7 @@ set_power() {
   while :; do
     confirmed=true
     for adapter in $adapters; do
-      if [[ $(busctl --system --timeout=1 get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null) != "b $value" ]]; then
-        busctl --system --timeout=1 set-property org.bluez "$adapter" org.bluez.Adapter1 Powered b "$value" >/dev/null 2>&1 || true
-        [[ $(busctl --system --timeout=1 get-property org.bluez "$adapter" org.bluez.Adapter1 Powered 2>/dev/null) == "b $value" ]] || confirmed=false
-      fi
+      set_adapter_power "$adapter" "$direction" || confirmed=false
     done
     [[ $confirmed == "true" ]] && return 0
     ((SECONDS < deadline)) || break
@@ -91,13 +157,31 @@ set_power() {
 }
 
 restore_power() {
+  local adapters adapter address direction confirmed=true
+  if ! read_preferences; then
+    echo "omarchy-bluetooth-power: invalid saved state" >&2
+    return 1
+  fi
   [[ -f $STATE_FILE ]] || return 0
-  local state
-  read -r state <"$STATE_FILE" || return 1
-  case "$state" in
-    on|off) set_power "$state" ;;
-    *) echo "omarchy-bluetooth-power: invalid saved state" >&2; return 1 ;;
-  esac
+  adapters=$(controllers) || return 1
+  [[ -n $adapters ]] || return 1
+
+  for adapter in $adapters; do
+    if ! address=$(adapter_address "$adapter"); then
+      confirmed=false
+      continue
+    fi
+    # Do not reapply a ready adapter's preference while a different adapter is
+    # still blocked: applications may have legitimately changed the ready one.
+    [[ ${1:-} == "--track" && ${ready[$address]:-} == "true" ]] && continue
+    direction=${preferences[$address]:-$default_preference}
+    if set_adapter_power "$adapter" "$direction"; then
+      [[ ${1:-} != "--track" ]] || ready[$address]=true
+    else
+      confirmed=false
+    fi
+  done
+  [[ $confirmed == "true" ]]
 }
 
 power_on() {
@@ -111,19 +195,15 @@ power_off() {
 }
 
 monitor_power() {
-  local restored=false sleep_pid=""
+  local scope=all sleep_pid=""
+  local -A ready=()
 
   cleanup_monitor() {
     if [[ -n $sleep_pid ]]; then
       kill "$sleep_pid" 2>/dev/null || true
       wait "$sleep_pid" 2>/dev/null || true
     fi
-    # A temporary off state while restoration is pending is not a new choice.
-    # The process owns this flag, so every normal stop/restart uses the same
-    # guard instead of an unconditional systemd ExecStop snapshot.
-    if [[ $restored == "true" ]]; then
-      snapshot_power
-    fi
+    snapshot_power "$scope"
   }
   trap cleanup_monitor EXIT
   trap 'exit 0' TERM INT
@@ -131,14 +211,16 @@ monitor_power() {
   # An update-session monitor adopts live power without applying old state.
   # Its only job is capturing subsequent changes on logout.
   if [[ ${1:-} != "--adopt" && -f $STATE_FILE ]]; then
-    until power_state >/dev/null && restore_power; do
+    scope=ready
+    until restore_power --track; do
       sleep 2
     done
+    # Once initial restoration finishes, include adapters plugged in later.
+    scope=all
   fi
-  restored=true
 
-  # A background wait lets TERM run cleanup immediately without losing the
-  # restoration flag to exec, or waiting forever for a foreground sleep.
+  # A background wait lets TERM snapshot ready adapters immediately without
+  # losing the readiness map to exec or waiting forever for foreground sleep.
   sleep infinity &
   sleep_pid=$!
   wait "$sleep_pid"
