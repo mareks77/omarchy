@@ -53,7 +53,18 @@ if [[ $1 == unblock ]]; then
   [[ -n ${MOCK_UNBLOCK_FAIL:-} ]] && exit 1
   [[ $(cat "$MOCK_DIR/block") == soft ]] && echo none >"$MOCK_DIR/block"
 elif [[ $1 == --raw ]]; then
-  if [[ $(cat "$MOCK_DIR/block") == soft ]]; then echo blocked; else echo unblocked; fi
+  [[ -n ${MOCK_RFKILL_READ_FAIL:-} ]] && exit 1
+  soft=unblocked hard=unblocked
+  case "$(cat "$MOCK_DIR/block")" in
+    soft) soft=blocked ;;
+    hard) hard=blocked ;;
+  esac
+  if [[ $* == *'--output SOFT,HARD'* ]]; then
+    printf '%s %s\n' "$soft" "$hard"
+    [[ -n ${MOCK_SECONDARY_BLOCK:-} ]] && echo 'unblocked blocked'
+  else
+    echo "$soft"
+  fi
 else
   echo "unexpected rfkill operation" >&2
   exit 1
@@ -371,6 +382,57 @@ wait_monitor_ready
 stop_monitor
 assert_saved on
 pass "update-session adoption captures current power without restoring stale preferences"
+
+for mode in restore adopt; do
+  for block in soft hard; do
+    reset_radio true
+    omarchy-bluetooth-power save on
+    if [[ $mode == "adopt" ]]; then
+      echo false >"$tmp/hci0"
+      echo "$block" >"$tmp/block"
+      omarchy-bluetooth-power monitor --adopt >/dev/null 2>&1 &
+    else
+      omarchy-bluetooth-power monitor >/dev/null 2>&1 &
+    fi
+    monitor_pid=$!
+    wait_monitor_ready
+    echo false >"$tmp/hci0"
+    echo "$block" >"$tmp/block"
+    stop_monitor
+    assert_saved on
+    [[ $(cat "$tmp/block") == "$block" ]] || fail "$mode monitor changes a $block block"
+    ! grep -q '^rfkill unblock' "$tmp/log" || fail "$mode monitor clears a $block block"
+    pass "$mode monitor preserves saved on when a temporary $block block forces power off"
+  done
+done
+
+# Public implicit snapshots use the same guard, while explicit off remains a
+# user choice even when a block is currently keeping the adapter down.
+omarchy-bluetooth-power save
+assert_saved on
+omarchy-bluetooth-power off
+assert_saved off
+pass "implicit blocked snapshots preserve preferences but explicit off is remembered"
+
+reset_radio false
+omarchy-bluetooth-power save on
+MOCK_RFKILL_READ_FAIL=1 omarchy-bluetooth-power save
+assert_saved on
+MOCK_RFKILL_READ_FAIL=1 omarchy-bluetooth-power monitor --adopt >/dev/null 2>&1 &
+monitor_pid=$!
+wait_monitor_ready
+stop_monitor
+assert_saved on
+pass "unreadable rfkill state cannot become a saved off preference"
+
+echo false >"$tmp/hci1"
+MOCK_SECONDARY_BLOCK=1 omarchy-bluetooth-power save
+assert_saved on
+rm "$tmp/hci1"
+# Exact blocked-token matching must not reject the ordinary unblocked state.
+omarchy-bluetooth-power save
+assert_saved off
+pass "secondary controller blocks are respected and genuine unblocked off is saved"
 
 reset_radio false
 omarchy-bluetooth-power save off

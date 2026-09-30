@@ -49,6 +49,21 @@ remember() {
   fi
 }
 
+snapshot_power() {
+  local state blocks
+  state=$(power_state) || return 0
+
+  # A radio restriction is not a new off preference, including in adopt mode
+  # where restoration was deliberately skipped. If any controller is blocked
+  # (or its rfkill state cannot be read), preserve the saved preference.
+  if [[ $state == "off" ]]; then
+    blocks=$(LC_ALL=C rfkill --raw --noheadings --output SOFT,HARD list bluetooth 2>/dev/null) || return 0
+    [[ $blocks =~ (^|[[:space:]])blocked($|[[:space:]]) ]] && return 0
+  fi
+
+  remember "$state"
+}
+
 set_power() {
   local direction=$1 value=false adapters adapter confirmed deadline=$((SECONDS + POWER_WAIT_SECONDS))
   [[ $direction == "on" ]] && value=true
@@ -99,7 +114,6 @@ monitor_power() {
   local restored=false sleep_pid=""
 
   cleanup_monitor() {
-    local state
     if [[ -n $sleep_pid ]]; then
       kill "$sleep_pid" 2>/dev/null || true
       wait "$sleep_pid" 2>/dev/null || true
@@ -108,7 +122,7 @@ monitor_power() {
     # The process owns this flag, so every normal stop/restart uses the same
     # guard instead of an unconditional systemd ExecStop snapshot.
     if [[ $restored == "true" ]]; then
-      state=$(power_state) && remember "$state"
+      snapshot_power
     fi
   }
   trap cleanup_monitor EXIT
@@ -152,11 +166,10 @@ case "${1:-}" in
     # An explicit preference lets migrations use the same atomic write path
     # even when BlueZ is down. Without an argument, snapshot actual power.
     case "${2:-}" in
-      on|off) state=$2 ;;
-      "") state=$(power_state) || exit 0 ;;
+      on|off) remember "$2" ;;
+      "") snapshot_power ;;
       *) echo "omarchy-bluetooth-power: invalid preference" >&2; exit 1 ;;
     esac
-    remember "$state"
     ;;
   restore)
     # A saved preference can outlive a USB adapter or an available daemon.
