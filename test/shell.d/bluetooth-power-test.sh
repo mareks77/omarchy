@@ -283,10 +283,11 @@ pass "connecting reuses power control only when needed"
 
 reset_radio false
 echo soft >"$tmp/block"
-bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+migration_output=$(bash -euo pipefail "$ROOT/migrations/1790784806.sh")
+grep -qxF 'Existing Bluetooth blocks are preserved. Enable Bluetooth once in Omarchy to allow application power-on.' <<<"$migration_output" || fail "migration hides the existing-block warning"
 assert_saved off
 [[ $(cat "$tmp/block") == soft && $(cat "$tmp/hci0") == false ]] || fail "migration changes an existing software block"
-bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+bash -euo pipefail "$ROOT/migrations/1790784806.sh"
 assert_saved off
 [[ $(cat "$tmp/block") == soft ]] || fail "migration retry clears an existing software block"
 ! grep -q '^rfkill unblock' "$tmp/log" || fail "migration clears airplane mode"
@@ -295,18 +296,18 @@ pass "migration preserves all existing blocks on first run and retry"
 
 reset_radio false
 echo soft >"$tmp/block"
-if MOCK_RENAME_FAIL=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"; then
+if MOCK_RENAME_FAIL=1 bash -euo pipefail "$ROOT/migrations/1790784806.sh"; then
   fail "migration continues after an atomic preference write fails"
 fi
 [[ ! -e $state_file && $(cat "$tmp/block") == soft ]] || fail "failed migration leaves partial state or changes radio blocks"
 ! compgen -G "$state_file.*" >/dev/null || fail "failed migration leaves staging files"
-bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+bash -euo pipefail "$ROOT/migrations/1790784806.sh"
 assert_saved off
 [[ $(stat -c %a "$state_file") == 600 ]] || fail "migration preference has the helper's private mode"
 pass "migration preference writes are atomic, private and retry-safe"
 
 reset_radio true
-MOCK_NO_SESSION=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+MOCK_NO_SESSION=1 bash -euo pipefail "$ROOT/migrations/1790784806.sh"
 assert_saved on
 [[ -L $HOME/.config/systemd/user/graphical-session.target.wants/omarchy-bluetooth-power.service ]] || fail "migration without a user manager enables next login"
 pass "migration preserves on and enables restoration without a user manager"
@@ -314,7 +315,7 @@ pass "migration preserves on and enables restoration without a user manager"
 reset_radio true
 echo false >"$tmp/hci1"
 echo soft >"$tmp/block-hci1"
-MOCK_NO_SESSION=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+MOCK_NO_SESSION=1 bash -euo pipefail "$ROOT/migrations/1790784806.sh"
 assert_saved on
 [[ $(cat "$tmp/block-hci1") == soft ]] || fail "migration unblocks secondary adapter"
 omarchy-bluetooth-power restore >/dev/null 2>&1 || true
@@ -323,7 +324,7 @@ pass "migration preserves a powered primary alongside a blocked secondary adapte
 
 reset_radio true
 omarchy-bluetooth-power save off # An application has since powered Bluetooth on.
-bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+bash -euo pipefail "$ROOT/migrations/1790784806.sh"
 assert_saved off
 [[ $(cat "$tmp/hci0") == true ]] || fail "migration interrupts active Bluetooth use"
 ! grep -Eq '^systemctl --user (start|restart)' "$tmp/log" || fail "migration starts or restarts a monitor over an active session"
@@ -332,8 +333,8 @@ pass "migration enables next login without reapplying stale off in the live sess
 
 reset_radio true
 omarchy-bluetooth-power save off
-MOCK_MONITOR_INACTIVE=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
-MOCK_MONITOR_INACTIVE=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+MOCK_MONITOR_INACTIVE=1 bash -euo pipefail "$ROOT/migrations/1790784806.sh"
+MOCK_MONITOR_INACTIVE=1 bash -euo pipefail "$ROOT/migrations/1790784806.sh"
 [[ $(grep -c '^systemd-run ' "$tmp/log") == 1 ]] || fail "migration duplicates the update-session monitor"
 grep -q '^systemd-run .*--collect.*--unit=omarchy-bluetooth-power-adopt.service.*--property=After=graphical-session.target.*--property=PartOf=graphical-session.target.*monitor --adopt$' "$tmp/log" || fail "migration monitor is not transient, session-bound and adopt-only"
 [[ $(cat "$tmp/hci0") == true ]] || fail "adopting an update session changes live power"
@@ -342,7 +343,7 @@ pass "migration launches one snapshot-only session-bound monitor without replaci
 
 reset_radio false
 echo soft >"$tmp/block"
-MOCK_BUS_DOWN=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
+MOCK_BUS_DOWN=1 bash -euo pipefail "$ROOT/migrations/1790784806.sh"
 assert_saved off
 [[ $(cat "$tmp/block") == soft ]] || fail "offline migration clears an existing radio block"
 pass "migration captures blocked off atomically without BlueZ or clearing the block"
